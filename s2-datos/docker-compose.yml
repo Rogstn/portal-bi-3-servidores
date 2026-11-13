@@ -1,0 +1,162 @@
+# =============================================================================
+# SERVIDOR 2 · DATOS  (producción: 24 vCPU · 72 GB · 500 GB NVMe)
+# Cero exposición a usuarios: NO publica ningún puerto.
+# Única salida: Kafka Connect hacia la fuente en AWS (red bi_aws).
+#
+#   1. Ejecutor de conectores (Kafka Connect: Debezium + sink ClickHouse)
+#   2. Bus de eventos (Kafka, retención 7 días)
+#   3. Almacén analítico (ClickHouse + Keeper)   reserva fija en prod: 8 vCPU · 32 GB
+#   4. Caché y preagregaciones (Cube Store)
+#   5. Base de metadatos (PostgreSQL: keycloak, superset, portal)
+#   + transformación (dbt) con su planificador
+#
+# Límites del laboratorio (techo, no consumo): ~5.5 vCPU · 8.5 GB.
+# Uso:  docker compose -p bi-s2 up -d     (es el PRIMERO que se levanta)
+# =============================================================================
+name: bi-s2
+
+services:
+
+  postgres-meta:                # 3 bases aisladas, una cuenta por servicio de S1
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-bi_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
+      POSTGRES_DB: ${POSTGRES_DB:-plataforma}
+      KEYCLOAK_DB_PASSWORD: ${KEYCLOAK_DB_PASSWORD:-}
+      SUPERSET_DB_PASSWORD: ${SUPERSET_DB_PASSWORD:-}
+    volumes:
+      - meta_data:/var/lib/postgresql/data
+      - ../../infra/postgres/init:/docker-entrypoint-initdb.d:ro   # crea keycloak, superset (y portal)
+    networks: [bi_s2, bi_meta, bi_respaldos]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
+      interval: 10s
+      retries: 10
+    cpus: 0.5
+    mem_limit: 768m
+
+  kafka:                        # Bus de eventos, KRaft, 7 días
+    image: apache/kafka:${KAFKA_VERSION:-4.1.0}
+    restart: unless-stopped
+    environment:
+      CLUSTER_ID: ${KAFKA_CLUSTER_ID:-5L6g3nShT-eMCtK--X86sw}
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_HEAP_OPTS: "-Xms512m -Xmx1g"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    networks: [bi_s2]
+    cpus: 1.0
+    mem_limit: 1536m
+
+  connect:                      # Ejecutor de conectores: el ÚNICO con salida hacia AWS
+    image: bi-connect:${DEBEZIUM_VERSION:-3.4.3.Final}   # se construye desde ../../infra/connect
+    restart: unless-stopped
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: bi-connect
+      CONFIG_STORAGE_TOPIC: bi_connect_configs
+      OFFSET_STORAGE_TOPIC: bi_connect_offsets
+      STATUS_STORAGE_TOPIC: bi_connect_status
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_CONFIG_PROVIDERS: env
+      CONNECT_CONFIG_PROVIDERS_ENV_CLASS: org.apache.kafka.common.config.provider.EnvVarConfigProvider
+      HEAP_OPTS: "-Xms512m -Xmx1g"
+    volumes:
+      - connect_tmp:/kafka/data      # en prod: disco separado para fsync
+    networks: [bi_s2, bi_aws]                # la ÚNICA con salida
+    cpus: 1.0
+    mem_limit: 1536m
+
+  keeper:                       # Coordinación de ClickHouse (KeeperMap para exactlyOnce del sink)
+    image: clickhouse/clickhouse-keeper:${CLICKHOUSE_VERSION:-25.8}
+    restart: unless-stopped
+    volumes:
+      - keeper_data:/var/lib/clickhouse-keeper
+      - ./keeper/keeper.xml:/etc/clickhouse-keeper/keeper_config.d/keeper.xml:ro
+    networks: [bi_s2]
+    cpus: 0.25
+    mem_limit: 256m
+
+  clickhouse:                   # Almacén analítico: raw_* -> stg -> mart
+    image: clickhouse/clickhouse-server:${CLICKHOUSE_VERSION:-25.8}
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_USER: ${CLICKHOUSE_ADMIN_USER:-bi_admin}
+      CLICKHOUSE_PASSWORD: ${CH_ADMIN_PASSWORD:-}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ../../infra/clickhouse/config.d:/etc/clickhouse-server/config.d:ro
+      - ../../infra/clickhouse/init:/docker-entrypoint-initdb.d:ro
+      - ../../cdc/ddl:/ddl:ro
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    networks: [bi_s2, bi_semantica, bi_respaldos]    # bi_semantica: solo Cube (cube_ro, lectura de mart)
+    cpus: 1.5
+    mem_limit: 3g
+
+  cubestore:                    # Caché y preagregaciones de la capa semántica
+    image: cubejs/cubestore:${CUBE_VERSION:-v1.6.58}
+    restart: unless-stopped
+    environment:
+      CUBESTORE_REMOTE_DIR: /cube/data
+    volumes:
+      - cubestore_data:/cube/data
+    networks: [bi_s2, bi_semantica]
+    cpus: 0.5
+    mem_limit: 768m
+
+  dbt-planificador:             # Corre "dbt build" cada 10 min contra ClickHouse
+    image: bi-dbt:${DBT_CLICKHOUSE_VERSION:-1.10.3}     # se construye desde ../../dbt
+    restart: unless-stopped
+    entrypoint: ["sh", "-c", "while true; do dbt build; sleep $${INTERVALO:-600}; done"]
+    environment:
+      DBT_CH_HOST: clickhouse
+      DBT_CH_PASSWORD: ${CH_DBT_PASSWORD:-}
+    volumes:
+      - ../../dbt:/dbt
+    networks: [bi_s2]
+    cpus: 0.5
+    mem_limit: 512m
+
+  agente:                       # Envía logs y métricas de S2 a S3
+    image: grafana/alloy:${ALLOY_VERSION:-v1.5.1}
+    restart: unless-stopped
+    command: ["run", "/etc/alloy/config.alloy"]
+    volumes:
+      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [bi_s2, bi_telemetria]
+    cpus: 0.25
+    mem_limit: 256m
+
+volumes:
+  meta_data:
+  kafka_data:
+  connect_tmp:
+  keeper_data:
+  clickhouse_data:
+  cubestore_data:
+
+networks:
+  bi_s2:         { external: true }
+  bi_meta:       { external: true }
+  bi_semantica:  { external: true }
+  bi_respaldos:  { external: true }
+  bi_telemetria: { external: true }
+  bi_aws:        { external: true }

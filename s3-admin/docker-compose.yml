@@ -1,0 +1,116 @@
+# =============================================================================
+# SERVIDOR 3 · ADMINISTRACIÓN  (producción: 8 vCPU · 32 GB · 500 GB SSD)
+# Administra S1 y S2, recibe sus logs y métricas en modo solo-anexar y saca
+# respaldos cifrados a un repositorio externo inmutable.
+# No tiene ruta hacia los usuarios: solo publica el bastión, y solo en 127.0.0.1.
+#
+# Límites del laboratorio (techo, no consumo): ~2.4 vCPU · 2.9 GB.
+# Uso:  docker compose -p bi-s3 up -d
+# =============================================================================
+name: bi-s3
+
+services:
+
+  bastion:                      # Única vía de administración: SSH con MFA (TOTP) y sesiones grabadas
+    image: lscr.io/linuxserver/openssh-server:${OPENSSH_VERSION:-latest}   # fijar versión al primer pull
+    restart: unless-stopped
+    environment:
+      PASSWORD_ACCESS: "false"
+      USER_NAME: admin-bi
+      PUBLIC_KEY_DIR: /config/llaves
+    ports:
+      - "127.0.0.1:2222:2222"   # desde fuera se llega por la red de gestión, nunca por la de usuarios
+    volumes:
+      - ./bastion:/config
+    networks: [bi_gestion, bi_s3]
+    cpus: 0.25
+    mem_limit: 256m
+
+  secretos:                     # Gestor de secretos (rotación 90 días, custodia dual con claves de desbloqueo)
+    image: openbao/openbao:${OPENBAO_VERSION:-2.2.0}
+    restart: unless-stopped
+    command: ["server", "-config=/openbao/config/openbao.hcl"]
+    cap_add: [IPC_LOCK]
+    volumes:
+      - ./openbao:/openbao/config:ro
+      - secretos_data:/openbao/file
+    networks: [bi_s3]                       # los secretos se entregan al desplegar, desde el bastión
+    cpus: 0.25
+    mem_limit: 256m
+
+  prometheus:                   # Métricas: recibe por remote-write desde los agentes (no sale a buscarlas)
+    image: prom/prometheus:${PROMETHEUS_VERSION:-v3.1.0}
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --web.enable-remote-write-receiver
+      - --storage.tsdb.retention.time=90d
+    volumes:
+      - ./prometheus:/etc/prometheus:ro
+      - prometheus_data:/prometheus
+    networks: [bi_s3, bi_telemetria]
+    cpus: 0.5
+    mem_limit: 768m
+
+  alertmanager:
+    image: prom/alertmanager:${ALERTMANAGER_VERSION:-v0.28.0}
+    restart: unless-stopped
+    volumes:
+      - ./alertmanager:/etc/alertmanager:ro
+    networks: [bi_s3]
+    cpus: 0.1
+    mem_limit: 128m
+
+  loki:                         # Logs en modo solo-anexar (sin API de borrado, retención fija)
+    image: grafana/loki:${LOKI_VERSION:-3.3.2}
+    restart: unless-stopped
+    command: ["-config.file=/etc/loki/loki.yml"]
+    volumes:
+      - ./loki:/etc/loki:ro
+      - loki_data:/loki
+    networks: [bi_s3, bi_telemetria]
+    cpus: 0.5
+    mem_limit: 768m
+
+  grafana:                      # Paneles de ingesta, semántica y experiencia; se abre por túnel SSH del bastión
+    image: grafana/grafana:${GRAFANA_VERSION:-11.4.0}
+    restart: unless-stopped
+    volumes:
+      - grafana_data:/var/lib/grafana
+    networks: [bi_s3]
+    cpus: 0.25
+    mem_limit: 256m
+
+  respaldos:                    # pg_dump + BACKUP de ClickHouse + restic cifrado -> repositorio inmutable
+    image: bi-respaldos:local   # Dockerfile propio: postgresql-client, clickhouse-client, restic
+    restart: unless-stopped
+    environment:
+      RESTIC_REPOSITORY: s3:http://repositorio:9000/respaldos-bi
+      RESTIC_PASSWORD_FILE: /run/secrets/restic
+    networks: [bi_s3, bi_respaldos, bi_repositorio]
+    cpus: 0.25
+    mem_limit: 256m
+
+  repositorio:                  # SIMULA el repositorio corporativo externo (MinIO con bloqueo de objetos)
+    image: minio/minio:${MINIO_VERSION:-RELEASE.2025-01-20T14-49-07Z}
+    restart: unless-stopped
+    command: ["server", "/data"]
+    volumes:
+      - repositorio_data:/data
+    networks: [bi_repositorio]
+    cpus: 0.25
+    mem_limit: 256m
+
+volumes:
+  secretos_data:
+  prometheus_data:
+  loki_data:
+  grafana_data:
+  repositorio_data:
+
+networks:
+  bi_s3:          { external: true }
+  bi_gestion:     { external: true }
+  bi_telemetria:  { external: true }
+  bi_respaldos:   { external: true }
+  bi_repositorio: { external: true }

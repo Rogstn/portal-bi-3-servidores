@@ -1,0 +1,36 @@
+# --- Secretos -----------------------------------------------------------------
+# El .env tiene las contraseñas reales del laboratorio: nunca se sube.
+.env
+.env.*
+!.env.example
+
+# Archivos de secretos (p. ej. la clave de restic para /run/secrets/restic)
+secretos/
+secrets/
+*.secret
+
+# Llaves y certificados (bastión SSH, TLS del proxy)
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+
+# --- Datos y respaldos locales ------------------------------------------------
+*.dump
+*.sql.gz
+*.backup
+respaldos-locales/
+
+# --- Logs ---------------------------------------------------------------------
+*.log
+
+# --- Windows / editores -------------------------------------------------------
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.idea/
+*.swp

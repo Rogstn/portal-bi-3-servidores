@@ -1,0 +1,33 @@
+# =============================================================================
+# AWS SIMULADO: hace de RDS/Aurora PostgreSQL mientras no haya acceso a la base real.
+# Vive en su propia red (bi_aws), a la que solo se conecta Kafka Connect de S2.
+# Cuando llegue la base real, este proyecto se apaga y el conector apunta al
+# endpoint de AWS con sslmode=verify-full (lo demás no cambia).
+# Uso:  docker compose -p bi-aws up -d
+# =============================================================================
+name: bi-aws
+
+services:
+  rds-simulado:
+    image: postgres:17
+    restart: unless-stopped
+    command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=4", "-c", "max_wal_senders=4"]
+    environment:
+      POSTGRES_USER: ${FUENTE_ADMIN_USER:-erp_admin}
+      POSTGRES_PASSWORD: ${FUENTE_ADMIN_PASSWORD:-}
+      POSTGRES_DB: erp
+      FUENTE_REPL_PASSWORD: ${FUENTE_REPL_PASSWORD:-}
+    volumes:
+      - rds_data:/var/lib/postgresql/data
+      - ../../infra/fuente/init:/docker-entrypoint-initdb.d:ro
+    networks:
+      bi_aws:
+        aliases: [fuente]       # el conector sigue usando database.hostname=fuente
+    cpus: 0.5
+    mem_limit: 512m
+
+volumes:
+  rds_data:
+
+networks:
+  bi_aws: { external: true }
